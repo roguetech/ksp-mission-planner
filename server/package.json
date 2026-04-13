@@ -1,0 +1,15 @@
+{
+  "name": "ksp-telemetry-bridge",
+  "version": "1.0.0",
+  "description": "Bridge server connecting kRPC to KSP Mission Planner",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "krpc-node": "^4.0.2",
+    "ws": "^8.16.0"
+  }
+}

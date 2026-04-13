@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+:root {
+  --ksp-green: #50c878;
+  --ksp-blue: #4169e1;
+  --ksp-orange: #ff6b35;
+  --ksp-dark: #1a1a2e;
+  --ksp-darker: #0f0f1a;
+}
+
+body {
+  margin: 0;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: linear-gradient(135deg, var(--ksp-darker) 0%, var(--ksp-dark) 100%);
+  min-height: 100vh;
+  color: #e0e0e0;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--ksp-darker);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--ksp-green);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3da85f;
+}
+
+/* Canvas styling for porkchop plots */
+canvas {
+  image-rendering: pixelated;
+}
