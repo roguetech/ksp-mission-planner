@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { VesselTelemetry, TelemetryConnection } from '../types';
+import * as telemetryDb from '../services/telemetryDb';
+import { clearServerDb, isServerAvailable } from '../services/telemetryServerApi';
 
 interface TelemetryState {
   // Connection
@@ -12,6 +14,13 @@ interface TelemetryState {
   // History for graphs (last 60 seconds of data)
   telemetryHistory: VesselTelemetry[];
   historyMaxLength: number;
+
+  // All tracked vessels (keyed by vessel name) — accumulates across vessel switches
+  vessels: Record<string, VesselTelemetry>;
+
+  // IndexedDB stats
+  dbSnapshotCount: number;
+  dbVesselCount: number;
 
   // Settings
   serverUrl: string;
@@ -27,6 +36,15 @@ interface TelemetryActions {
   // Telemetry updates
   updateTelemetry: (telemetry: VesselTelemetry) => void;
   clearTelemetry: () => void;
+  clearVessels: () => void;
+
+  // DB operations
+  /** Load last-known vessels from IndexedDB into the store (call once on app start). */
+  initFromDb: () => Promise<void>;
+  /** Wipe all stored snapshots and vessels from IndexedDB. */
+  clearDb: () => Promise<void>;
+  /** Refresh dbSnapshotCount / dbVesselCount from IndexedDB. */
+  refreshDbStats: () => Promise<void>;
 
   // Settings
   setAutoReconnect: (enabled: boolean) => void;
@@ -41,6 +59,9 @@ type TelemetryStore = TelemetryState & TelemetryActions;
 
 const DEFAULT_SERVER_URL = 'ws://localhost:8080';
 
+/** Rolling counter used to throttle snapshot writes (one per SNAPSHOT_EVERY_N updates). */
+let updateCounter = 0;
+
 export const useTelemetryStore = create<TelemetryStore>()(
   persist(
     (set, get) => ({
@@ -54,18 +75,19 @@ export const useTelemetryStore = create<TelemetryStore>()(
       telemetry: null,
       telemetryHistory: [],
       historyMaxLength: 120, // 60 seconds at 2 updates/sec
+      vessels: {},
+      dbSnapshotCount: 0,
+      dbVesselCount: 0,
       serverUrl: DEFAULT_SERVER_URL,
       autoReconnect: true,
       updateInterval: 500,
 
-      // Connection management
+      // ── Connection management ──────────────────────────────────────────────
+
       setServerUrl: (url) => {
         set({
           serverUrl: url,
-          connection: {
-            ...get().connection,
-            serverUrl: url,
-          },
+          connection: { ...get().connection, serverUrl: url },
         });
       },
 
@@ -80,51 +102,105 @@ export const useTelemetryStore = create<TelemetryStore>()(
         });
       },
 
-      // Telemetry updates
-      updateTelemetry: (telemetry) => {
-        const { telemetryHistory, historyMaxLength } = get();
+      // ── Telemetry updates ─────────────────────────────────────────────────
 
-        // Add to history, keeping only recent entries
+      updateTelemetry: (telemetry) => {
+        const { telemetryHistory, historyMaxLength, vessels } = get();
+
+        // Rolling in-memory history
         const newHistory = [...telemetryHistory, telemetry];
-        if (newHistory.length > historyMaxLength) {
-          newHistory.shift();
-        }
+        if (newHistory.length > historyMaxLength) newHistory.shift();
 
         set({
           telemetry,
           telemetryHistory: newHistory,
+          vessels: { ...vessels, [telemetry.name]: telemetry },
           connection: {
             ...get().connection,
             lastUpdate: Date.now(),
             status: 'connected',
           },
         });
+
+        // ── IndexedDB persistence (fire-and-forget) ────────────────────────
+        // Save every update — both as a time-series snapshot and as latest vessel position
+        telemetryDb.saveSnapshot(telemetry).catch(console.error);
+        telemetryDb.saveVessel(telemetry).catch(console.error);
+
+        // Refresh the UI snapshot counter every 20 updates (avoid hammering IDB count())
+        updateCounter++;
+        if (updateCounter % 20 === 0) {
+          telemetryDb
+            .getSnapshotCount()
+            .then((count) => set({ dbSnapshotCount: count }))
+            .catch(console.error);
+        }
       },
 
       clearTelemetry: () => {
-        set({
-          telemetry: null,
-          telemetryHistory: [],
-        });
+        set({ telemetry: null, telemetryHistory: [], vessels: {} });
       },
 
-      // Settings
-      setAutoReconnect: (enabled) => {
-        set({ autoReconnect: enabled });
+      clearVessels: () => {
+        set({ vessels: {} });
       },
 
-      setUpdateInterval: (interval) => {
-        set({ updateInterval: interval });
+      // ── DB operations ──────────────────────────────────────────────────────
+
+      initFromDb: async () => {
+        try {
+          const [storedVessels, snapCount, vesselCount] = await Promise.all([
+            telemetryDb.getAllVessels(),
+            telemetryDb.getSnapshotCount(),
+            telemetryDb.getVesselCount(),
+          ]);
+
+          // Seed vessels map from DB (live telemetry will overwrite as it arrives)
+          const dbVesselsMap: Record<string, VesselTelemetry> = {};
+          for (const v of storedVessels) {
+            dbVesselsMap[v.name] = v;
+          }
+
+          set((state) => ({
+            vessels: { ...dbVesselsMap, ...state.vessels },
+            dbSnapshotCount: snapCount,
+            dbVesselCount: vesselCount,
+          }));
+        } catch (err) {
+          console.error('[TelemetryDB] initFromDb failed:', err);
+        }
       },
 
-      // Helpers
+      clearDb: async () => {
+        // Clear both stores in parallel; ignore server error if offline
+        await Promise.all([
+          telemetryDb.clearAll(),
+          isServerAvailable().then((up) => up ? clearServerDb() : Promise.resolve()).catch(() => {}),
+        ]);
+        set({ dbSnapshotCount: 0, dbVesselCount: 0, vessels: {} });
+        updateCounter = 0;
+      },
+
+      refreshDbStats: async () => {
+        const [snapCount, vesselCount] = await Promise.all([
+          telemetryDb.getSnapshotCount(),
+          telemetryDb.getVesselCount(),
+        ]);
+        set({ dbSnapshotCount: snapCount, dbVesselCount: vesselCount });
+      },
+
+      // ── Settings ──────────────────────────────────────────────────────────
+
+      setAutoReconnect: (enabled) => set({ autoReconnect: enabled }),
+      setUpdateInterval: (interval) => set({ updateInterval: interval }),
+
+      // ── Helpers ───────────────────────────────────────────────────────────
+
       getResourcePercentage: (resource) => {
         const { telemetry } = get();
         if (!telemetry) return 0;
-
         const current = telemetry[resource];
         const max = telemetry[`${resource}Max` as keyof VesselTelemetry] as number;
-
         if (!max || max === 0) return 0;
         return (current / max) * 100;
       },
@@ -137,7 +213,7 @@ export const useTelemetryStore = create<TelemetryStore>()(
     }),
     {
       name: 'ksp-telemetry-store',
-      // Only persist settings, not live data
+      // Only persist settings — live data and DB state are hydrated separately
       partialize: (state) => ({
         serverUrl: state.serverUrl,
         autoReconnect: state.autoReconnect,
@@ -147,7 +223,8 @@ export const useTelemetryStore = create<TelemetryStore>()(
   )
 );
 
-// Selectors
+// ── Selectors ──────────────────────────────────────────────────────────────────
+
 export const selectIsConnected = (state: TelemetryStore) =>
   state.connection.status === 'connected';
 

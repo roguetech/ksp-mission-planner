@@ -1,20 +1,35 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { ConnectionPanel } from './ConnectionPanel';
 import { TelemetryDisplay } from './TelemetryDisplay';
 import { LiveScienceTracker, ScienceSummary, VesselScienceStatus } from './LiveScienceTracker';
 import { CompactTelemetry } from './VesselTracker';
+import { VehiclePositioningMap } from './VehiclePositioningMap';
+import { FlightReplayPanel } from './FlightReplayPanel';
 import { useTelemetryStore } from '../../stores/telemetryStore';
 import { Card, CardHeader, StatCard } from '../common';
 
 export function TelemetryPanel() {
-  const { telemetry, connection, telemetryHistory } = useTelemetryStore();
+  const {
+    telemetry,
+    connection,
+    telemetryHistory,
+    dbSnapshotCount,
+    dbVesselCount,
+    initFromDb,
+    clearDb,
+  } = useTelemetryStore();
+
+  // Load last-known vessels from IndexedDB on first mount
+  useEffect(() => {
+    initFromDb();
+  }, []);
 
   const isConnected = connection.status === 'connected';
 
   return (
     <div className="space-y-6">
       {/* Stats Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
         <StatCard
           label="Connection Status"
           value={isConnected ? 'Connected' : 'Disconnected'}
@@ -38,6 +53,19 @@ export function TelemetryPanel() {
           label="Biome"
           value={telemetry?.biome || 'N/A'}
         />
+        {/* DB stats card */}
+        <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-3 flex flex-col justify-between">
+          <div className="text-xs text-gray-500 mb-1">Local DB</div>
+          <div className="text-sm font-mono text-gray-200">
+            {dbSnapshotCount.toLocaleString()} pts · {dbVesselCount} vessel{dbVesselCount !== 1 ? 's' : ''}
+          </div>
+          <button
+            onClick={() => { if (confirm('Clear all stored telemetry from the local database?')) clearDb(); }}
+            className="mt-2 text-xs text-red-500 hover:text-red-400 text-left transition-colors"
+          >
+            Clear DB
+          </button>
+        </div>
         <div className="flex items-center justify-center">
           <ScienceSummary />
         </div>
@@ -105,6 +133,12 @@ export function TelemetryPanel() {
           <TelemetryDisplay />
         </div>
       </div>
+
+      {/* Vehicle Positioning Map */}
+      <VehiclePositioningMap />
+
+      {/* Flight Replay */}
+      <FlightReplayPanel />
 
       {/* Altitude/Speed History Graph (placeholder) */}
       {isConnected && telemetryHistory.length > 10 && (

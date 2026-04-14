@@ -1,23 +1,79 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card, CardHeader, Button, StatCard } from '../common';
 import { ScienceMap } from './ScienceMap';
 import { BiomeMap } from './BiomeMap';
 import { ExperimentList } from './ExperimentList';
 import { ScienceChecklist } from './ScienceChecklist';
-import { useScienceStore } from '../../stores/scienceStore';
+import { useScienceStore, kspSituationToScience } from '../../stores/scienceStore';
+import { requestAllScienceFromGame } from '../../services/telemetryWs';
+import { useTelemetryStore } from '../../stores/telemetryStore';
 import { celestialBodies, bodiesArray } from '../../data/bodies';
 import { bodyBiomeData } from '../../data/biomeCoordinates';
 import { getTotalPossibleScience, getRemainingScience } from '../../lib/science';
+import { ScienceHistory } from './ScienceHistory';
+
+const SIT_LABEL: Record<string, string> = {
+  landed: 'Landed', splashed: 'Splashed', flying: 'Flying',
+  inSpaceLow: 'Space Low', inSpaceHigh: 'Space High',
+};
 
 export function SciencePlanner() {
-  const { collectedScience, getTotalScience, exportScience, importScience, clearAllScience } =
+  const { collectedScience, getTotalScience, exportScience, importScience, clearAllScience, syncFromTelemetry } =
     useScienceStore();
+  const { telemetry, connection } = useTelemetryStore();
+
   const [selectedBody, setSelectedBody] = useState('kerbin');
   const [selectedBiome, setSelectedBiome] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
   const [showBiomeMap, setShowBiomeMap] = useState(false);
   const [importJson, setImportJson] = useState('');
   const [importError, setImportError] = useState('');
+  const [syncMsg, setSyncMsg] = useState<string | null>(null);
+  const [importingAll, setImportingAll] = useState(false);
+
+  const isConnected = connection.status === 'connected';
+
+  // Derived telemetry state
+  const liveBodyId  = telemetry?.bodyId?.toLowerCase() ?? null;
+  const liveBiome   = telemetry?.biome ?? null;
+  const liveSciSit  = telemetry
+    ? kspSituationToScience(telemetry.situation, telemetry.altitude, liveBodyId ?? 'kerbin')
+    : null;
+  const liveBody    = liveBodyId ? celestialBodies[liveBodyId] : null;
+
+  // Auto-jump to the vessel's current body when it changes
+  useEffect(() => {
+    if (liveBodyId && liveBodyId !== selectedBody) setSelectedBody(liveBodyId);
+  }, [liveBodyId]);
+
+  const handleSync = () => {
+    if (!telemetry) return;
+    const count = syncFromTelemetry(telemetry);
+    setSyncMsg(
+      count > 0
+        ? `Synced ${count} experiment${count !== 1 ? 's' : ''} from vessel.`
+        : 'No new experiments to sync (vessel may have no unreported data).',
+    );
+    setTimeout(() => setSyncMsg(null), 4000);
+  };
+
+  const handleImportAll = () => {
+    setImportingAll(true);
+    setSyncMsg('Requesting science history from game…');
+    requestAllScienceFromGame((newCount, rawCount) => {
+      setImportingAll(false);
+      if (newCount === -1) {
+        setSyncMsg('Not connected — cannot import from game.');
+      } else if (rawCount === 0) {
+        setSyncMsg('Server returned 0 subjects — kRPC science_subjects may be unavailable. Check bridge logs.');
+      } else if (newCount === 0) {
+        setSyncMsg(`Server sent ${rawCount} subjects — all already up to date.`);
+      } else {
+        setSyncMsg(`Imported ${newCount} new experiment${newCount !== 1 ? 's' : ''} (${rawCount} received from R&D).`);
+      }
+      setTimeout(() => setSyncMsg(null), 7000);
+    });
+  };
 
   const totalCollected = getTotalScience();
 
@@ -73,8 +129,12 @@ export function SciencePlanner() {
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <StatCard
           label="Total Science Collected"
-          value={totalCollected.toFixed(0)}
-          unit="points"
+          value={
+            isConnected && telemetry?.totalSciencePoints != null
+              ? telemetry.totalSciencePoints.toFixed(0)
+              : totalCollected.toFixed(0)
+          }
+          unit={isConnected && telemetry?.totalSciencePoints != null ? 'pts (live)' : 'points'}
           icon={
             <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path
@@ -86,11 +146,7 @@ export function SciencePlanner() {
             </svg>
           }
         />
-        <StatCard
-          label="Overall Progress"
-          value={overallProgress.percentage.toFixed(1)}
-          unit="%"
-        />
+        <StatCard label="Overall Progress" value={overallProgress.percentage.toFixed(1)} unit="%" />
         <StatCard
           label="Bodies Completed"
           value={completedBodies}
@@ -103,10 +159,55 @@ export function SciencePlanner() {
         />
       </div>
 
+      {/* Live telemetry banner — shown only when connected */}
+      {isConnected && telemetry && (
+        <Card>
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                <span className="text-sm font-medium text-emerald-400">Live Telemetry</span>
+              </div>
+              <div className="flex items-center gap-2 text-sm text-gray-300">
+                {liveBody && (
+                  <span className="flex items-center gap-1">
+                    <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: liveBody.color }} />
+                    {liveBody.name}
+                  </span>
+                )}
+                {liveBiome && (
+                  <span className="text-gray-400">· {liveBiome}</span>
+                )}
+                {liveSciSit && (
+                  <span className="px-1.5 py-0.5 rounded text-xs bg-blue-900/40 text-blue-300 border border-blue-700/50">
+                    {SIT_LABEL[liveSciSit] ?? liveSciSit}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-3 flex-wrap">
+              {syncMsg && (
+                <span className="text-sm text-emerald-400">{syncMsg}</span>
+              )}
+              <Button variant="secondary" onClick={handleSync}>
+                Sync from Vessel
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={handleImportAll}
+                disabled={importingAll}
+              >
+                {importingAll ? 'Importing…' : 'Import All from Game'}
+              </Button>
+            </div>
+          </div>
+        </Card>
+      )}
+
       {/* Action buttons */}
       <Card>
         <div className="flex items-center justify-between">
-          <div className="text-gray-400">
+          <div className="text-gray-400 text-sm">
             Track your science collection progress across the Kerbol system
           </div>
           <div className="flex gap-2">
@@ -223,6 +324,9 @@ export function SciencePlanner() {
             })}
         </div>
       </Card>
+
+      {/* Science history */}
+      <ScienceHistory />
 
       {/* Import modal */}
       {showImport && (

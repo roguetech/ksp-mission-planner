@@ -9,6 +9,7 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
+    "better-sqlite3": "^12.9.0",
     "krpc-node": "^4.0.2",
     "ws": "^8.16.0"
   }

@@ -487,6 +487,39 @@ export interface VesselExperiment {
   canDeploy?: boolean;
 }
 
+// ─── Tracking Station Types ───────────────────────────────────────────────────
+
+/** One vessel as seen from the Tracking Station (all vessels, not just active). */
+export interface TrackedVessel {
+  name: string;
+  vesselType: string;
+  situation: VesselSituation;
+  bodyId: string;
+  bodyName: string;
+
+  // Orbital elements — angular values in degrees, distances in metres from body centre
+  semiMajorAxis: number;
+  apoapsis: number;           // metres above sea level
+  periapsis: number;          // metres above sea level
+  eccentricity: number;
+  inclination: number;        // degrees
+  argumentOfPeriapsis: number; // degrees
+  longitudeOfAscendingNode: number; // degrees
+  trueAnomaly: number;        // degrees
+  meanAnomaly: number;        // degrees
+  orbitalPeriod: number;      // seconds
+  timeToApoapsis: number;     // seconds
+  timeToPeriapsis: number;    // seconds
+
+  // Instantaneous state
+  orbitalSpeed: number;       // m/s
+  latitude: number;
+  longitude: number;
+  altitude: number;           // metres above sea level
+
+  timestamp: number;
+}
+
 export interface TelemetryConnection {
   status: 'disconnected' | 'connecting' | 'connected' | 'error';
   serverUrl: string;

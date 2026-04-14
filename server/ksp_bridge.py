@@ -281,12 +281,10 @@ def get_telemetry() -> dict:
         except Exception as e:
             telemetry["vesselExperiments"] = []
 
-        # Get R&D science subjects (what science has been collected in career)
+        # Total science points in the R&D facility
         try:
-            if hasattr(conn, 'space_center') and hasattr(conn.space_center, 'science'):
-                # Get total science points
-                telemetry["totalSciencePoints"] = conn.space_center.science
-        except:
+            telemetry["totalSciencePoints"] = conn.space_center.science
+        except Exception:
             pass
 
         return telemetry
@@ -305,6 +303,217 @@ async def broadcast(message: str):
         )
 
 
+# ── Science subject parsing ───────────────────────────────────────────────────
+
+# KSP internal body names → our lowercase IDs
+_KSP_BODY_MAP = {
+    'Kerbin': 'kerbin', 'Mun': 'mun', 'Minmus': 'minmus',
+    'Eve': 'eve', 'Gilly': 'gilly', 'Duna': 'duna', 'Ike': 'ike',
+    'Dres': 'dres', 'Jool': 'jool', 'Laythe': 'laythe', 'Vall': 'vall',
+    'Tylo': 'tylo', 'Bop': 'bop', 'Pol': 'pol', 'Eeloo': 'eeloo',
+    'Moho': 'moho', 'Sun': 'kerbol',
+}
+_BODY_NAMES_DESC = sorted(_KSP_BODY_MAP.keys(), key=len, reverse=True)
+
+# KSP situation strings → our ScienceSituation values
+_KSP_SIT_MAP = {
+    'InSpaceLow':  'inSpaceLow',
+    'InSpaceHigh': 'inSpaceHigh',
+    'FlyingLow':   'flying',
+    'FlyingHigh':  'flying',
+    'SrfLanded':   'landed',
+    'SrfSplashed': 'splashed',
+}
+_SIT_CODES_DESC = sorted(_KSP_SIT_MAP.keys(), key=len, reverse=True)
+
+
+def parse_science_subject_id(subject_id: str) -> dict | None:
+    """
+    Parse a KSP science subject ID into its components.
+    Format: {experimentId}@{BodyName}{SituationCode}{BiomeName}
+    Returns dict with experimentId, bodyId, situation, biome — or None if unparseable.
+    """
+    if '@' not in subject_id:
+        return None
+    experiment_id, location = subject_id.split('@', 1)
+
+    # Extract body
+    body_id = None
+    for name in _BODY_NAMES_DESC:
+        if location.startswith(name):
+            body_id = _KSP_BODY_MAP[name]
+            location = location[len(name):]
+            break
+    if body_id is None:
+        return None
+
+    # Extract situation
+    situation = None
+    for code in _SIT_CODES_DESC:
+        if location.startswith(code):
+            situation = _KSP_SIT_MAP[code]
+            location = location[len(code):]
+            break
+    if situation is None:
+        return None
+
+    # Remainder is the biome (may be empty for space/flying)
+    biome = location  # raw CamelCase biome, frontend normalises
+
+    return {
+        'experimentId': experiment_id,
+        'bodyId': body_id,
+        'situation': situation,
+        'biome': biome,        # CamelCase, e.g. "NorthernIceShelf"
+    }
+
+
+def get_all_collected_science() -> list:
+    """
+    Return all science subjects that have had science recovered to R&D.
+
+    Strategy (each tried in order, stops at first success with > 0 results):
+    1. conn.space_center.science_subjects  (kRPC property, most versions)
+    2. conn.space_center.science_subjects() (kRPC procedure form)
+    3. Scan every experiment part on every vessel for stored data
+    4. Scan every experiment part for its current-location science_subject history
+    """
+    global conn
+    if not conn:
+        return []
+    collected = {}
+
+    # ── Strategy 1 & 2: R&D subject list via kRPC ────────────────────────────
+    for _attempt in range(2):
+        try:
+            raw_subjects = (conn.space_center.science_subjects
+                            if _attempt == 0
+                            else conn.space_center.science_subjects())
+            count_before = len(collected)
+            for subj in raw_subjects:
+                try:
+                    sci = subj.science
+                    if sci <= 0:
+                        continue
+                    sid = subj.id
+                    parsed = parse_science_subject_id(sid)
+                    if parsed:
+                        collected[sid] = {**parsed, 'value': sci}
+                except Exception as inner:
+                    print(f"[Science]  subject error: {inner}", flush=True)
+            added = len(collected) - count_before
+            print(f"[Science] Strategy {_attempt + 1}: {added} subjects with science > 0", flush=True)
+            if len(collected) > 0:
+                return list(collected.values())
+        except Exception as e:
+            print(f"[Science] Strategy {_attempt + 1} failed: {e}", flush=True)
+
+    # ── Strategy 3: stored data in experiment containers on all vessels ────────
+    print("[Science] Falling back to vessel experiment scan…", flush=True)
+    try:
+        for vessel in conn.space_center.vessels:
+            try:
+                for exp in vessel.parts.experiments:
+                    try:
+                        for data in exp.data:
+                            try:
+                                subj = data.science_subject
+                                sid = subj.id
+                                if sid not in collected:
+                                    parsed = parse_science_subject_id(sid)
+                                    if parsed:
+                                        val = (subj.science or 0) + (data.amount or 0)
+                                        collected[sid] = {**parsed, 'value': val}
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Science] Strategy 3 error: {e}", flush=True)
+
+    # ── Strategy 4: science_subject history at each vessel's current location ──
+    # For experiments with no stored data, science_subject.science reveals how
+    # much has already been recovered for this vessel's current location.
+    try:
+        for vessel in conn.space_center.vessels:
+            try:
+                for exp in vessel.parts.experiments:
+                    try:
+                        subj = exp.science_subject
+                        sci = subj.science
+                        if sci > 0:
+                            sid = subj.id
+                            if sid not in collected:
+                                parsed = parse_science_subject_id(sid)
+                                if parsed:
+                                    collected[sid] = {**parsed, 'value': sci}
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Science] Strategy 4 error: {e}", flush=True)
+
+    print(f"[Science] Vessel scan total: {len(collected)} subjects", flush=True)
+    return list(collected.values())
+
+
+def get_tracking_data() -> dict | None:
+    """Fetch all vessels from the tracking station."""
+    global conn
+    if not conn:
+        return None
+    try:
+        all_vessels = conn.space_center.vessels
+        tracked = []
+        for v in all_vessels:
+            try:
+                orbit = v.orbit
+                body = orbit.body
+                flight = v.flight(v.orbital_reference_frame)
+                inc_rad = orbit.inclination
+                arg_pe_rad = orbit.argument_of_periapsis
+                raan_rad = orbit.longitude_of_ascending_node
+                ta_rad = orbit.true_anomaly
+                ma_rad = orbit.mean_anomaly
+                tracked.append({
+                    "name": v.name,
+                    "vesselType": str(v.type).split('.')[-1],
+                    "situation": situation_to_string(v.situation),
+                    "bodyId": body.name.lower(),
+                    "bodyName": body.name,
+                    "semiMajorAxis": orbit.semi_major_axis,
+                    "apoapsis": orbit.apoapsis_altitude,
+                    "periapsis": orbit.periapsis_altitude,
+                    "eccentricity": orbit.eccentricity,
+                    "inclination": inc_rad * 180 / math.pi,
+                    "argumentOfPeriapsis": arg_pe_rad * 180 / math.pi,
+                    "longitudeOfAscendingNode": raan_rad * 180 / math.pi,
+                    "trueAnomaly": ta_rad * 180 / math.pi,
+                    "meanAnomaly": ma_rad * 180 / math.pi,
+                    "orbitalPeriod": orbit.period,
+                    "timeToApoapsis": orbit.time_to_apoapsis,
+                    "timeToPeriapsis": orbit.time_to_periapsis,
+                    "orbitalSpeed": orbit.speed,
+                    "latitude": flight.latitude,
+                    "longitude": flight.longitude,
+                    "altitude": flight.mean_altitude,
+                    "timestamp": int(time.time() * 1000),
+                })
+            except Exception:
+                pass  # skip vessels we can't read
+        return {"type": "tracking", "vessels": tracked}
+    except Exception as e:
+        print(f"Error fetching tracking data: {e}", flush=True)
+        return None
+
+
+# Cache the last tracking snapshot so new clients get it immediately
+last_tracking_snapshot: str | None = None
+
+
 async def telemetry_loop():
     """Main loop that fetches and broadcasts telemetry."""
     while True:
@@ -317,15 +526,45 @@ async def telemetry_loop():
         await asyncio.sleep(UPDATE_INTERVAL)
 
 
+async def tracking_loop():
+    """Fetch all vessels every 2 seconds and broadcast as tracking data."""
+    global last_tracking_snapshot
+    while True:
+        tracking = get_tracking_data()
+        if tracking is not None:
+            sanitized = sanitize_for_json(tracking)
+            msg = json.dumps(sanitized)
+            last_tracking_snapshot = msg
+            if clients:
+                await broadcast(msg)
+        await asyncio.sleep(2.0)
+
+
 async def handle_client(websocket):
     """Handle a WebSocket client connection."""
     clients.add(websocket)
     print(f"Client connected. Total clients: {len(clients)}")
 
+    # Send the most recent tracking snapshot immediately so the client
+    # doesn't have to wait up to 2 seconds for the next interval tick.
+    if last_tracking_snapshot:
+        try:
+            await websocket.send(last_tracking_snapshot)
+        except Exception:
+            pass
+
     try:
         async for message in websocket:
-            # Handle any client messages if needed
-            pass
+            try:
+                msg = json.loads(message)
+                if msg.get('type') == 'requestAllScience':
+                    print("[Science] Client requested full science import", flush=True)
+                    subjects = get_all_collected_science()
+                    response = sanitize_for_json({'type': 'allScience', 'subjects': subjects})
+                    await websocket.send(json.dumps(response))
+                    print(f"[Science] Sent {len(subjects)} subjects to client", flush=True)
+            except Exception as e:
+                print(f"[WS] Error handling client message: {e}", flush=True)
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -381,8 +620,9 @@ async def main():
     async with websockets.serve(handle_client, "0.0.0.0", WS_PORT) as server:
         print(f"Server ready! Connect from web app to ws://localhost:{WS_PORT}", flush=True)
 
-        # Start telemetry loop
-        telemetry_task = asyncio.create_task(telemetry_loop())
+        # Start telemetry and tracking loops
+        asyncio.create_task(telemetry_loop())
+        asyncio.create_task(tracking_loop())
 
         # Run forever
         await asyncio.Future()  # Run forever
